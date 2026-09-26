@@ -394,7 +394,8 @@ const PACKAGE_STAT_EVENT_BATCH_SIZE = 100;
 export const PROCESSED_PACKAGE_STAT_EVENT_PRUNE_CONFIRMATION_TOKEN =
   "PRUNE_PROCESSED_PACKAGE_STAT_EVENTS";
 const DEFAULT_PROCESSED_PACKAGE_STAT_EVENT_RETENTION_DAYS = 7;
-const MIN_PROCESSED_PACKAGE_STAT_EVENT_RETENTION_DAYS = 1;
+// A completed 24-hour window can start almost 25 hours before the current time.
+const MIN_PROCESSED_PACKAGE_STAT_EVENT_RETENTION_DAYS = 2;
 const MAX_PROCESSED_PACKAGE_STAT_EVENT_RETENTION_DAYS = 90;
 const DEFAULT_PROCESSED_PACKAGE_STAT_EVENT_PRUNE_BATCH_SIZE = 1_000;
 const MAX_PROCESSED_PACKAGE_STAT_EVENT_PRUNE_BATCH_SIZE = 5_000;
@@ -721,6 +722,7 @@ type PublicPackageListItem = {
   categories?: string[];
   topics?: string[];
   featuredAt?: number;
+  trending24h?: { downloads: number; installs: number; windowStart: number; windowEnd: number };
   verificationTier: PackageVerificationTier | null;
   stats: Doc<"packages">["stats"];
 };
@@ -4838,11 +4840,20 @@ async function listPackagePageImpl(
   }
 
   if (args.sort === "trending") {
-    const leaderboard = await ctx.db
+    const currentLeaderboard = await ctx.db
       .query("packageLeaderboards")
       .withIndex("by_kind", (q) => q.eq("kind", PACKAGE_TRENDING_LEADERBOARD_KIND))
       .order("desc")
       .first();
+    // Keep the existing feed until the first completed 24-hour snapshot is ready.
+    // Legacy entries have no window metrics and must never be labeled as 24-hour counts.
+    const leaderboard =
+      currentLeaderboard ??
+      (await ctx.db
+        .query("packageLeaderboards")
+        .withIndex("by_kind", (q) => q.eq("kind", "package_trending"))
+        .order("desc")
+        .first());
     if (!leaderboard) return { page: [], isDone: true, continueCursor: "" };
 
     const cursorState = decodePublicPageCursor(args.paginationOpts.cursor);
@@ -4857,7 +4868,21 @@ async function listPackagePageImpl(
       if (getPluginDiscoveryExclusion(pkg.categories) || !isEnglishPluginListing(pkg)) continue;
       if (!(await canViewerReadPackage(ctx, pkg, viewerUserId, membershipCache))) continue;
       if (!packageMatchesListFilters(pkg, { ...args, category, topic })) continue;
-      page.push(await toPublicPackageListItemFromPackage(ctx, pkg));
+      page.push({
+        ...(await toPublicPackageListItemFromPackage(ctx, pkg)),
+        ...(currentLeaderboard &&
+        leaderboard.rangeStartAt !== undefined &&
+        leaderboard.rangeEndAt !== undefined
+          ? {
+              trending24h: {
+                downloads: entry.downloads,
+                installs: entry.installs,
+                windowStart: leaderboard.rangeStartAt,
+                windowEnd: leaderboard.rangeEndAt,
+              },
+            }
+          : {}),
+      });
       if (page.length >= targetCount) break;
     }
     const isDone = nextOffset >= leaderboard.items.length;
